@@ -1,8 +1,9 @@
 import logging
 import pathlib
+import sys
 from typing import List
-
-import optuna
+from functools import partial
+import haiku as hk
 
 import equinox as eqx
 import gymnasium as gym
@@ -19,12 +20,61 @@ from jaxtyping import Array, PyTree
 from little_helpers.equinox_helpers import eqx_init_optimiser
 from little_helpers.gym_helpers import get_trajectory
 
-from little_helpers.rl_helpers import get_future_rewards
+# from little_helpers.rl_helpers import get_future_rewards
 from optax import GradientTransformation
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 _logger = logging.getLogger(__name__)
+
+
+class HaikuModel(hk.Module):
+    def __init__(self, n_in: int, n_out: int, h1: int, h2: int):
+        super().__init__()
+        self.n_out = n_out
+        self.h1 = h1
+        self.h2 = h2
+
+    def __call__(self, x: int) -> Array:
+        x = hk.Linear(self.h1)(x)
+        x = jax.nn.relu(x)
+        x = hk.Linear(self.h2)(x)
+        x = jax.nn.relu(x)
+        x = hk.Linear(self.n_out)(x)
+        return x
+
+
+# @jax.jit
+def get_future_rewards(rewards: jnp.ndarray, gamma=0.99) -> jnp.ndarray:
+    returns = jnp.zeros_like(rewards)
+    future_returns = 0
+
+    for t in range(len(rewards) - 1, -1, -1):
+        future_returns = rewards[t] + gamma * future_returns
+        returns = returns.at[t].set(future_returns)
+
+    return returns
+
+
+"""
+def get_future_rewards(rewards: jnp.ndarray, gamma=0.99) -> jnp.ndarray:
+    def scan_fn(carry, reward):
+        return (carry * gamma,) + reward, None
+
+    _, returns = jax.lax.scan(scan_fn, 0, rewards[::-1])
+    return returns[::-1]
+
+
+def get_future_rewards(rewards: Array, gamma=0.99) -> Array: 
+    print(f"get_future_rewards_fn: {type(rewards)=}")
+    T = len(rewards)
+    returns = np.empty(T)
+    future_returns = 0.0
+    for t in reversed(range(T)):
+        future_returns = rewards[t] + gamma * future_returns
+        returns[t] = future_returns
+    return jnp.array(returns)
+"""
 
 
 class RLDataset(Dataset):
@@ -43,55 +93,31 @@ class RLDataset(Dataset):
         return ob, action, reward
 
 
-@eqx.filter_jit
-def act(obs: int, model: eqx.Module, key: jax.random.PRNGKeyArray) -> int:
+# @partial(jax.jit, static_argnums=(1,))
+def act(obs: int, model: hk.Module, key: jax.random.PRNGKeyArray, params) -> int:
     key, subkey = jax.random.split(key)
-    logits = model(obs)
+    logits = model.apply(params, None, obs)
     action = tfp.distributions.Categorical(logits=logits).sample(seed=subkey)
     return action
 
 
-class Model(eqx.Module):
-    layers: list
-
-    def __init__(
-        self, n_in: int, n_out: int, h1: int, h2: int, key: jax.random.PRNGKeyArray
-    ):
-        super().__init__()
-
-        key1, key2, key3 = jax.random.split(key, 3)
-
-        self.layers = [
-            # eqx.nn.Embedding(n_in, 4, key=key1),
-            eqx.nn.Linear(n_in, h1, key=key1),
-            jax.nn.relu,
-            eqx.nn.Linear(h1, h2, key=key2),
-            jax.nn.relu,
-            eqx.nn.Linear(h2, n_out, key=key3),
-        ]
-
-    def __call__(self, x: int) -> Array:
-        for layer in self.layers:
-            x = layer(x)
-        return x
-
-
-@eqx.filter_jit
 def train(
+    t_model: hk.Module,
+    t_params: PyTree,
     t_optim: GradientTransformation,
     t_opt_state: PyTree,
-    t_params: PyTree,
     t_eps_obs: Array,
     t_eps_actions: Array,
     t_eps_rewards: Array,
 ):
+    # @jax.jit
     def loss_fn(
-        l_model: PyTree,
+        l_params: optax.Params,
         l_states: Array,
         l_rewards: Array,
         l_actions: Array,
     ) -> Array:
-        logits = jax.vmap(l_model)(l_states)
+        logits = t_model.apply(l_params, None, l_states)
         advantages = get_future_rewards(l_rewards)
 
         actions = l_actions.reshape(-1)
@@ -105,18 +131,19 @@ def train(
 
         return l_loss_value
 
+    # @jax.jit
     def step(
-        s_params: PyTree,
+        s_params: optax.Params,
         s_eps_obs: Array,
         s_eps_rewards: List,
         s_eps_actions: Array,
         s_opt_state: PyTree,
     ):
-        s_loss_value, grads = eqx.filter_value_and_grad(loss_fn)(
+        s_loss_value, grads = jax.value_and_grad(loss_fn)(
             s_params, s_eps_obs, s_eps_rewards, s_eps_actions
         )
         updates, s_opt_state = t_optim.update(grads, s_opt_state, s_params)
-        s_params = eqx.apply_updates(s_params, updates)
+        s_params = optax.apply_updates(s_params, updates)
         return s_params, s_opt_state, s_loss_value
 
     params, opt_state, loss_value = step(
@@ -140,13 +167,13 @@ def experiment(env: Env, hyperparams: dict) -> dict:
     obs_space = env.observation_space.shape[0]
     act_space = env.action_space.n
 
-    key = jax.random.PRNGKey(0)
-
-    model = Model(obs_space, act_space, h1, h2, key)
+    model = hk.transform(lambda x: HaikuModel(obs_space, act_space, h1, h2)(x))
+    rng_seq = hk.PRNGSequence(42)
+    params = model.init(next(rng_seq), obs)
 
     optim = optax.adamw(learning_rate=learning_rate)
-    opt_state = eqx_init_optimiser(optim, model)
-
+    opt_state = optim.init(params)
+    key = jax.random.PRNGKey(42)
     epoch_reward = []
     for epoch in range(n_epochs):
         total_rewards = []
@@ -156,9 +183,8 @@ def experiment(env: Env, hyperparams: dict) -> dict:
                 env=env,
                 key=subkey,
                 act_fn=act,
-                act_fn_kwargs={"model": model},
+                act_fn_kwargs={"model": model, "params": params},
             )
-
             dataset = RLDataset(
                 np.array(rewards), np.array(eps_actions), np.array(eps_obs)
             )
@@ -167,10 +193,11 @@ def experiment(env: Env, hyperparams: dict) -> dict:
             )
             for batch in dataloader:
                 obs_batch, action_batch, reward_batch = batch
-                model, opt_state, loss_value = train(
+                params, opt_state, loss_value = train(
+                    model,
+                    params,
                     optim,
                     opt_state,
-                    model,
                     obs_batch.numpy(),
                     action_batch.numpy(),
                     reward_batch.numpy(),
@@ -183,7 +210,7 @@ def experiment(env: Env, hyperparams: dict) -> dict:
     plt.xlabel("Epoch")
     plt.ylabel("Mean Reward")
     plot_path = pathlib.Path(__file__).parent / "plots/vanilla_policy_gradient"
-    plt.savefig(f"{plot_path}/{env_name}-{np.round(np.mean(epoch_reward), 2)}.png")
+    plt.savefig(f"{plot_path}/{env_name}.png")
 
     # Saving the model
     model_path = pathlib.Path(__file__).parent / "models/vanilla_policy_gradient"
@@ -202,46 +229,40 @@ def experiment(env: Env, hyperparams: dict) -> dict:
     }
 
 
-def objective(trial: optuna.Trial, env_name: str, max_eps_steps: int) -> float:
-    env = gym.make(env_name)
-    if max_eps_steps:
-        env = gym.wrappers.TimeLimit(env, max_episode_steps=max_eps_steps)
+def main():
+    max_eps_steps = 200
 
-    hyperparams = {
-        "learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-1),
-        "n_epochs": 10,
-        "n_episodes": 1000,
-        "h1": trial.suggest_int("h1", 1, 20),
-        "h2": trial.suggest_int("h2", 1, 20),
+    env_names = {
+        # "CartPole-v1": 200,
+        # "MountainCar-v0": None,
+        # "Acrobot-v1": None,
+        "LunarLander-v2": None,
     }
 
-    _experiment = experiment(env, hyperparams)
-    mean_reward = np.mean(_experiment["epoch_reward"])
-    return mean_reward
+    envs = []
+
+    for env_name, max_eps_steps in env_names.items():
+        env = gym.make(env_name)
+        if max_eps_steps:
+            env = gym.wrappers.TimeLimit(env, max_episode_steps=max_eps_steps)
+        envs.append(env)
+
+    hyperparams = {
+        "learning_rate": 0.001,
+        "n_epochs": 5,
+        "n_episodes": 500,
+        "h1": 4,
+        "h2": 6,
+    }
+
+    for env in envs:
+        env_name = env.spec.name
+        _experiment = experiment(env, hyperparams)
+        _logger.info(f"Experiment Complete: {env_name}")
+        _logger.info(f"Mean Reward: {np.mean(_experiment['epoch_reward'])}")
+        _logger.info(f"Std Reward: {np.std(_experiment['total_rewards'])}")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
-    env_names = [
-        # "CartPole-v1",
-        "MountainCar-v0",
-        "Acrobot-v1",
-        "LunarLander-v2",
-    ]
-    max_eps_steps = [200, None, None, None]
-    current_file_path = pathlib.Path(__file__).parent.absolute()
-    database_url = current_file_path.parent / "studies/studies.db"
-    for env_name, max_eps_steps in zip(env_names, max_eps_steps):
-        study = optuna.create_study(
-            direction="maximize",
-            storage=f"sqlite:///{database_url}",
-            study_name=env_name,
-            load_if_exists=True,
-        )
-        study.optimize(
-            lambda trial: objective(trial, env_name, max_eps_steps),
-            n_trials=20,
-        )
-        _logger.info(f"Best trial: {study.best_trial.value}")
-        _logger.info(f"Best trial params: {study.best_trial.params}")
+    main()
